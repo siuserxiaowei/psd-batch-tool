@@ -1,0 +1,38 @@
+:root {
+  --surface: #efeee7;
+  --ink: #1c2e30;
+  --muted: #6c7773;
+  --line: #d8d4c8;
+  --accent: #2d4b4e;
+  font-family:
+    Avenir Next,
+    PingFang SC,
+    Hiragino Sans GB,
+    Microsoft YaHei,
+    sans-serif;
+  color: var(--ink);
+  background: var(--surface);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+input,
+select {
+  font-family: inherit;
+}
+
+::selection {
+  color: #f9f7ef;
+  background: #2d4b4e;
+}
