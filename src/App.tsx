@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import {
+  AlertTriangle,
   Archive,
   Check,
   ChevronLeft,
@@ -7,12 +8,15 @@ import {
   Download,
   FileImage,
   FileSpreadsheet,
+  FolderOpen,
   FlaskConical,
   ImagePlus,
   Layers,
   Loader2,
   MousePointer2,
   RefreshCcw,
+  Save,
+  Type,
   Upload,
   Wand2,
 } from 'lucide-react'
@@ -22,6 +26,7 @@ import { readPsd, type Layer, type Psd } from 'ag-psd'
 import './App.css'
 
 type SlotMode = 'fill' | 'fit' | 'stretch'
+type SlotMask = 'rect' | 'round' | 'circle'
 type SlotType = 'image' | 'text'
 type LayerKind = 'group' | 'image' | 'text'
 
@@ -44,10 +49,12 @@ type SlotConfig = {
   alias: string
   type: SlotType
   mode: SlotMode
+  mask?: SlotMask
   fontSize?: number
   color?: string
   align?: CanvasTextAlign
   weight?: number
+  fontFamily?: string
 }
 
 type ImageAsset = {
@@ -60,10 +67,25 @@ type ImageAsset = {
 
 type RowData = Record<string, string | number | boolean | null | undefined>
 
+type FontAsset = {
+  file: File
+  name: string
+  stem: string
+  family: string
+  url: string
+}
+
 type DownloadState = {
   url: string
   name: string
   size: number
+}
+
+type ValidationIssue = {
+  rowIndex: number
+  alias: string
+  message: string
+  severity: 'warning' | 'error'
 }
 
 const modeLabels: Record<SlotMode, string> = {
@@ -72,10 +94,28 @@ const modeLabels: Record<SlotMode, string> = {
   stretch: '拉伸',
 }
 
+const maskLabels: Record<SlotMask, string> = {
+  rect: '矩形',
+  round: '圆角',
+  circle: '圆形',
+}
+
 const slotTypeLabels: Record<SlotType, string> = {
   image: '图片',
   text: '文字',
 }
+
+const defaultTextFamily = 'Avenir Next, PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif'
+
+const builtInFonts = [
+  { label: '默认', value: '' },
+  { label: '苹方', value: 'PingFang SC, Microsoft YaHei, sans-serif' },
+  { label: '宋体', value: 'Songti SC, SimSun, serif' },
+  { label: '楷体', value: 'Kaiti SC, KaiTi, serif' },
+  { label: 'Avenir', value: 'Avenir Next, PingFang SC, sans-serif' },
+]
+
+const storagePrefix = 'psd-batch-tool:slots:'
 
 const blendModes: Record<string, GlobalCompositeOperation> = {
   normal: 'source-over',
@@ -135,6 +175,9 @@ const safeName = (value: string) =>
     .replace(/\s+/g, '_')
     .slice(0, 80) || 'poster'
 
+const configKeyForTemplate = (name: string, psd: Pick<Psd, 'width' | 'height'>) =>
+  `${storagePrefix}${safeName(stripExtension(name || 'untitled'))}:${psd.width}x${psd.height}`
+
 const imageFromFile = (file: File) =>
   new Promise<ImageAsset>((resolve, reject) => {
     const url = URL.createObjectURL(file)
@@ -164,6 +207,22 @@ const fileFromCanvas = (canvas: HTMLCanvasElement, name: string) =>
       resolve(new File([blob], name, { type: 'image/png' }))
     }, 'image/png')
   })
+
+const fontFromFile = async (file: File): Promise<FontAsset> => {
+  const url = URL.createObjectURL(file)
+  const stem = stripExtension(file.name)
+  const family = `Uploaded_${safeName(stem).replace(/[^\w-]/g, '_')}_${Math.random().toString(36).slice(2, 7)}`
+
+  try {
+    const font = new FontFace(family, `url(${url})`)
+    await font.load()
+    document.fonts.add(font)
+    return { file, name: file.name, stem, family, url }
+  } catch (error) {
+    URL.revokeObjectURL(url)
+    throw error instanceof Error ? error : new Error(`字体无法读取：${file.name}`)
+  }
+}
 
 const parseCsv = (text: string) => {
   const rows: string[][] = []
@@ -245,15 +304,28 @@ const inferSlotType = (item: Pick<FlatLayer, 'kind' | 'name'>): SlotType => {
 
 const defaultTextSize = (height: number) => Math.max(14, Math.min(96, Math.round(height * 0.72)))
 
+const isReplacementLayer = (item: Pick<FlatLayer, 'name'>) =>
+  /(_?替换$|换图|可变|变量|replace|variable)/i.test(item.name)
+
+const inferSlotMode = (item: Pick<FlatLayer, 'name'>): SlotMode =>
+  /(logo|标志|商标|二维码|qrcode|qr)/i.test(item.name) ? 'fit' : 'fill'
+
+const inferSlotMask = (item: Pick<FlatLayer, 'name'>): SlotMask => {
+  if (/(头像|人像|headshot|avatar|portrait)/i.test(item.name)) return 'circle'
+  if (/(logo|标志|商标|icon|图标)/i.test(item.name)) return 'round'
+  return 'rect'
+}
+
 const slotFromLayer = (item: FlatLayer, used: Set<string>): SlotConfig => {
   const type = inferSlotType(item)
   return {
     id: item.id,
     name: item.name,
     path: item.path,
-    alias: toAlias(item.name.replace(/_?替换$/i, ''), used),
+    alias: toAlias(item.name.replace(/(_?替换$|换图|可变|变量|replace|variable)/gi, ''), used),
     type,
-    mode: 'fill',
+    mode: inferSlotMode(item),
+    mask: type === 'image' ? inferSlotMask(item) : undefined,
     fontSize: type === 'text' ? defaultTextSize(item.height) : undefined,
     color: type === 'text' ? '#ffffff' : undefined,
     align: 'center',
@@ -286,8 +358,9 @@ const flattenLayers = (children: Layer[] = [], parent = '', depth = 0): FlatLaye
 const pickDefaultSlots = (layers: FlatLayer[]) => {
   const used = new Set<string>()
   const usable = layers.filter((item) => hasCanvas(item.layer) && !item.hidden && item.width > 40 && item.height > 40)
+  const replacement = usable.filter(isReplacementLayer)
   const preferred = usable.filter((item) => !/(背景|底图|background|bg|backdrop)/i.test(item.name))
-  const source = preferred.length ? preferred : usable
+  const source = replacement.length ? replacement : preferred.length ? preferred : usable
 
   return source
     .filter((item) => hasCanvas(item.layer) && !item.hidden && item.width > 40 && item.height > 40)
@@ -296,12 +369,14 @@ const pickDefaultSlots = (layers: FlatLayer[]) => {
       const bBoost = /(商品|产品|主图|图片|换图|替换|image|photo|product|replace)/i.test(b.name) ? 10_000_000 : 0
       return b.width * b.height + bBoost - (a.width * a.height + aBoost)
     })
-    .slice(0, 4)
+    .slice(0, replacement.length ? 12 : 4)
     .map<SlotConfig>((item) => slotFromLayer(item, used))
 }
 
 const buildDemoSlots = (layers: FlatLayer[]) => {
   const productSlot = layers.find((item) => item.name === '商品图_替换')
+  const logoSlot = layers.find((item) => item.name === 'Logo_替换')
+  const nameSlot = layers.find((item) => item.name === '姓名_替换')
   const labelSlot = layers.find((item) => item.name === '角标文案_替换')
   const priceSlot = layers.find((item) => item.name === '价格_替换')
   const slots: SlotConfig[] = []
@@ -314,6 +389,34 @@ const buildDemoSlots = (layers: FlatLayer[]) => {
       alias: '商品图',
       type: 'image',
       mode: 'fill',
+      mask: 'rect',
+    })
+  }
+
+  if (logoSlot) {
+    slots.push({
+      id: logoSlot.id,
+      name: logoSlot.name,
+      path: logoSlot.path,
+      alias: 'Logo',
+      type: 'image',
+      mode: 'fit',
+      mask: 'round',
+    })
+  }
+
+  if (nameSlot) {
+    slots.push({
+      id: nameSlot.id,
+      name: nameSlot.name,
+      path: nameSlot.path,
+      alias: '姓名',
+      type: 'text',
+      mode: 'fill',
+      color: '#233f40',
+      align: 'left',
+      weight: 850,
+      fontSize: 38,
     })
   }
 
@@ -404,6 +507,25 @@ const makeDemoPsd = (): Psd => {
     ctx.fillText('活动海报模板 · 图片槽位可批量替换', 2, 122)
   })
 
+  const attendeeName = createCanvas(360, 56, (ctx) => {
+    ctx.fillStyle = '#233f40'
+    ctx.font = '850 42px Avenir Next, PingFang SC, sans-serif'
+    ctx.textBaseline = 'middle'
+    ctx.fillText('参会姓名', 0, 30)
+  })
+
+  const logoSlot = createCanvas(140, 52, (ctx) => {
+    ctx.fillStyle = '#f9f7ef'
+    ctx.beginPath()
+    ctx.roundRect(0, 0, 140, 52, 10)
+    ctx.fill()
+    ctx.fillStyle = '#233f40'
+    ctx.font = '800 22px Avenir Next, sans-serif'
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillText('LOGO', 70, 27)
+  })
+
   const priceBadge = createCanvas(230, 132, (ctx) => {
     ctx.fillStyle = '#d29b37'
     ctx.beginPath()
@@ -438,9 +560,11 @@ const makeDemoPsd = (): Psd => {
     height,
     children: [
       { name: '品牌_LOGO', top: 28, left: 48, bottom: 92, right: 288, canvas: logo },
+      { name: 'Logo_替换', top: 34, left: 690, bottom: 86, right: 830, canvas: logoSlot },
       { name: '价格_替换', top: 886, left: 634, bottom: 944, right: 784, canvas: priceValue, text: { text: '¥199' } },
       { name: '角标文案_替换', top: 842, left: 652, bottom: 876, right: 764, canvas: priceLabel, text: { text: '限时价' } },
       { name: '黄色价格底框', top: 828, left: 594, bottom: 960, right: 824, canvas: priceBadge },
+      { name: '姓名_替换', top: 286, left: 72, bottom: 326, right: 432, canvas: attendeeName, text: { text: '参会姓名' } },
       { name: '标题文案', top: 144, left: 70, bottom: 294, right: 830, canvas: headline },
       { name: '商品图_替换', top: 330, left: 190, bottom: 950, right: 710, canvas: product },
       { name: '背景', top: 0, left: 0, bottom: height, right: width, canvas: background },
@@ -452,21 +576,42 @@ const makeDemoPsd = (): Psd => {
 
 const makeDemoProductFiles = async () => {
   const specs = [
-    { name: 'product-a.png', hue: '#2f6f73', accent: '#d7a23d', label: 'A款' },
-    { name: 'product-b.png', hue: '#8f4e45', accent: '#233f40', label: 'B款' },
-    { name: 'product-c-wide.png', hue: '#435f8a', accent: '#ead9b8', label: '横版' },
-    { name: 'product-d-tall.png', hue: '#5d7656', accent: '#1f3a31', label: '竖版' },
+    { name: 'product-a.png', hue: '#2f6f73', accent: '#d7a23d', label: 'A款', kind: 'product' },
+    { name: 'product-b.png', hue: '#8f4e45', accent: '#233f40', label: 'B款', kind: 'product' },
+    { name: 'product-c-wide.png', hue: '#435f8a', accent: '#ead9b8', label: '横版', kind: 'product' },
+    { name: 'product-d-tall.png', hue: '#5d7656', accent: '#1f3a31', label: '竖版', kind: 'product' },
+    { name: 'logo-a.png', hue: '#233f40', accent: '#d7a23d', label: 'DONT', kind: 'logo' },
+    { name: 'logo-b.png', hue: '#8f4e45', accent: '#f9f7ef', label: 'FLOW', kind: 'logo' },
+    { name: 'logo-c.png', hue: '#435f8a', accent: '#f9f7ef', label: 'NOVA', kind: 'logo' },
+    { name: 'logo-d.png', hue: '#5d7656', accent: '#f9f7ef', label: 'MUSE', kind: 'logo' },
   ]
 
   const files = await Promise.all(
     specs.map((spec, index) => {
+      const logo = spec.kind === 'logo'
       const wide = spec.name.includes('wide')
       const tall = spec.name.includes('tall')
-      const width = wide ? 900 : tall ? 420 : 700
-      const height = wide ? 500 : tall ? 900 : 700
+      const width = logo ? 420 : wide ? 900 : tall ? 420 : 700
+      const height = logo ? 156 : wide ? 500 : tall ? 900 : 700
       const canvas = createCanvas(width, height, (ctx) => {
         ctx.fillStyle = '#fbfaf2'
         ctx.fillRect(0, 0, width, height)
+        if (logo) {
+          ctx.fillStyle = spec.hue
+          ctx.beginPath()
+          ctx.roundRect(18, 18, width - 36, height - 36, 24)
+          ctx.fill()
+          ctx.fillStyle = spec.accent
+          ctx.beginPath()
+          ctx.arc(72, height / 2, 28, 0, Math.PI * 2)
+          ctx.fill()
+          ctx.fillStyle = '#ffffff'
+          ctx.font = '900 44px Avenir Next, sans-serif'
+          ctx.textAlign = 'center'
+          ctx.textBaseline = 'middle'
+          ctx.fillText(spec.label, width / 2 + 44, height / 2 + 2)
+          return
+        }
         ctx.fillStyle = spec.hue
         ctx.beginPath()
         ctx.roundRect(width * 0.14, height * 0.12, width * 0.72, height * 0.72, 38)
@@ -510,6 +655,16 @@ function resolveImageForSlot(
   return imageIndex.get(normalized) || imageIndex.get(stem) || images.find((item) => item.stem.toLowerCase() === stem)
 }
 
+function buildFontIndex(fonts: FontAsset[]) {
+  const fontIndex = new Map<string, string>()
+  fonts.forEach((asset) => {
+    fontIndex.set(asset.name.toLowerCase(), asset.family)
+    fontIndex.set(asset.stem.toLowerCase(), asset.family)
+    fontIndex.set(asset.family.toLowerCase(), asset.family)
+  })
+  return fontIndex
+}
+
 function resolveVisibility(row: RowData, slot: SlotConfig) {
   const raw =
     row[`show:${slot.alias}`] ??
@@ -533,6 +688,48 @@ function resolveTextForSlot(row: RowData, slot: SlotConfig) {
   return raw === undefined || raw === null ? undefined : String(raw)
 }
 
+function resolveFontForSlot(row: RowData, slot: SlotConfig, fontIndex: Map<string, string>) {
+  const raw =
+    row[`字体:${slot.alias}`] ??
+    row[`${slot.alias}:字体`] ??
+    row[`font:${slot.alias}`] ??
+    row[`${slot.alias}:font`] ??
+    row['字体'] ??
+    row['font']
+
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return slot.fontFamily
+  }
+
+  const value = String(raw).trim()
+  const normalized = normalizeKey(value)
+  return fontIndex.get(value.toLowerCase()) || fontIndex.get(normalized) || fontIndex.get(stripExtension(normalized)) || value
+}
+
+function clipSlot(
+  ctx: CanvasRenderingContext2D,
+  left: number,
+  top: number,
+  width: number,
+  height: number,
+  mask: SlotMask = 'rect',
+) {
+  ctx.beginPath()
+  if (mask === 'circle') {
+    const radius = Math.min(width, height) / 2
+    ctx.arc(left + width / 2, top + height / 2, radius, 0, Math.PI * 2)
+    ctx.clip()
+    return
+  }
+  if (mask === 'round') {
+    ctx.roundRect(left, top, width, height, Math.min(width, height) * 0.16)
+    ctx.clip()
+    return
+  }
+  ctx.rect(left, top, width, height)
+  ctx.clip()
+}
+
 function drawReplacement(
   ctx: CanvasRenderingContext2D,
   image: HTMLImageElement,
@@ -541,6 +738,7 @@ function drawReplacement(
   width: number,
   height: number,
   mode: SlotMode,
+  mask: SlotMask = 'rect',
 ) {
   if (!width || !height) return
   let sx = 0
@@ -575,9 +773,7 @@ function drawReplacement(
   }
 
   ctx.save()
-  ctx.beginPath()
-  ctx.rect(left, top, width, height)
-  ctx.clip()
+  clipSlot(ctx, left, top, width, height, mask)
   ctx.drawImage(image, sx, sy, sw, sh, dx, dy, dw, dh)
   ctx.restore()
 }
@@ -594,7 +790,7 @@ function drawReplacementText(
   if (!width || !height) return
   const lines = text.split(/\r?\n/)
   const baseSize = slot.fontSize || defaultTextSize(height / Math.max(1, lines.length))
-  const family = 'Avenir Next, PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif'
+  const family = slot.fontFamily || defaultTextFamily
   const weight = slot.weight || 850
   const maxWidth = width * 0.94
   const maxHeight = height * 0.92
@@ -639,6 +835,7 @@ function renderPsd(
   slots: SlotConfig[],
   row: RowData | undefined,
   images: ImageAsset[],
+  fonts: FontAsset[],
 ): HTMLCanvasElement {
   const canvas = document.createElement('canvas')
   canvas.width = psd.width
@@ -652,6 +849,7 @@ function renderPsd(
     imageIndex.set(asset.name.toLowerCase(), asset)
     imageIndex.set(asset.stem.toLowerCase(), asset)
   })
+  const fontIndex = buildFontIndex(fonts)
 
   const drawLayer = (layer: Layer, id: string) => {
     if (layer.hidden) return
@@ -678,9 +876,12 @@ function renderPsd(
     const text = slot?.type === 'text' && row ? resolveTextForSlot(row, slot) : undefined
     const replacement = slot?.type === 'image' && row ? resolveImageForSlot(row, slot, images, imageIndex) : undefined
     if (slot?.type === 'text' && text !== undefined) {
-      drawReplacementText(ctx, text, left, top, width, height, slot)
+      drawReplacementText(ctx, text, left, top, width, height, {
+        ...slot,
+        fontFamily: row ? resolveFontForSlot(row, slot, fontIndex) : slot.fontFamily,
+      })
     } else if (replacement && slot) {
-      drawReplacement(ctx, replacement.image, left, top, width, height, slot.mode)
+      drawReplacement(ctx, replacement.image, left, top, width, height, slot.mode, slot.mask)
     } else {
       ctx.drawImage(original, left, top)
     }
@@ -706,12 +907,64 @@ const canvasToBlob = (canvas: HTMLCanvasElement) =>
     }, 'image/png')
   })
 
+function validateRows(rows: RowData[], slots: SlotConfig[], images: ImageAsset[]) {
+  if (!rows.length || !slots.length) return []
+  const imageIndex = new Map<string, ImageAsset>()
+  images.forEach((asset) => {
+    imageIndex.set(asset.name.toLowerCase(), asset)
+    imageIndex.set(asset.stem.toLowerCase(), asset)
+  })
+
+  const issues: ValidationIssue[] = []
+  rows.forEach((row, rowIndex) => {
+    slots.forEach((slot) => {
+      if (slot.type === 'text') {
+        if (resolveTextForSlot(row, slot) === undefined) {
+          issues.push({
+            rowIndex,
+            alias: slot.alias,
+            severity: 'warning',
+            message: `第 ${rowIndex + 1} 行缺少「${slot.alias}」文字`,
+          })
+        }
+        return
+      }
+
+      const raw = [slot.alias, slot.name, slot.path, stripExtension(slot.alias)]
+        .map((key) => row[key])
+        .find((item) => String(item ?? '').trim())
+      if (!raw) {
+        issues.push({
+          rowIndex,
+          alias: slot.alias,
+          severity: 'warning',
+          message: `第 ${rowIndex + 1} 行缺少「${slot.alias}」图片名`,
+        })
+        return
+      }
+
+      const normalized = normalizeKey(raw)
+      const stem = stripExtension(normalized)
+      if (!imageIndex.has(normalized) && !imageIndex.has(stem)) {
+        issues.push({
+          rowIndex,
+          alias: slot.alias,
+          severity: 'error',
+          message: `第 ${rowIndex + 1} 行找不到图片「${String(raw)}」`,
+        })
+      }
+    })
+  })
+  return issues
+}
+
 function App() {
   const [psd, setPsd] = useState<Psd | null>(null)
   const [psdName, setPsdName] = useState('')
   const [layers, setLayers] = useState<FlatLayer[]>([])
   const [slots, setSlots] = useState<SlotConfig[]>([])
   const [images, setImages] = useState<ImageAsset[]>([])
+  const [fonts, setFonts] = useState<FontAsset[]>([])
   const [rows, setRows] = useState<RowData[]>([])
   const [sheetName, setSheetName] = useState('')
   const [download, setDownload] = useState<DownloadState | null>(null)
@@ -722,6 +975,7 @@ function App() {
   const psdInputRef = useRef<HTMLInputElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
   const sheetInputRef = useRef<HTMLInputElement>(null)
+  const fontInputRef = useRef<HTMLInputElement>(null)
 
   const generatedRows = useMemo<RowData[]>(() => {
     if (rows.length) return rows
@@ -735,6 +989,12 @@ function App() {
 
   const selectedIds = useMemo(() => new Set(slots.map((slot) => slot.id)), [slots])
   const slotAliases = useMemo(() => slots.map((slot) => slot.alias).join(' / '), [slots])
+  const validationIssues = useMemo(() => validateRows(generatedRows, slots, images), [generatedRows, images, slots])
+  const errorCount = validationIssues.filter((issue) => issue.severity === 'error').length
+  const fontOptions = useMemo(
+    () => [...builtInFonts, ...fonts.map((font) => ({ label: stripExtension(font.name), value: font.family }))],
+    [fonts],
+  )
   const activeRow = generatedRows[previewIndex]
 
   useEffect(() => {
@@ -744,7 +1004,7 @@ function App() {
 
     let revoked = ''
     window.requestAnimationFrame(() => {
-      const canvas = renderPsd(psd, slots, activeRow, images)
+      const canvas = renderPsd(psd, slots, activeRow, images, fonts)
       const url = canvas.toDataURL('image/png')
       revoked = url
       setPreviewUrl((previous) => {
@@ -756,7 +1016,7 @@ function App() {
     return () => {
       if (revoked.startsWith('blob:')) URL.revokeObjectURL(revoked)
     }
-  }, [activeRow, images, psd, slots])
+  }, [activeRow, fonts, images, psd, slots])
 
   useEffect(() => {
     return () => {
@@ -766,9 +1026,45 @@ function App() {
 
   useEffect(() => {
     return () => {
+      fonts.forEach((asset) => URL.revokeObjectURL(asset.url))
+    }
+  }, [fonts])
+
+  useEffect(() => {
+    return () => {
       if (download) URL.revokeObjectURL(download.url)
     }
   }, [download])
+
+  const readSavedSlots = (name: string, template: Psd, flat: FlatLayer[]) => {
+    try {
+      const raw = window.localStorage.getItem(configKeyForTemplate(name, template))
+      if (!raw) return undefined
+      const parsed = JSON.parse(raw) as { slots?: SlotConfig[] }
+      const ids = new Set(flat.map((item) => item.id))
+      const saved = (parsed.slots || []).filter((slot) => ids.has(slot.id))
+      return saved.length ? saved : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  const saveTemplateConfig = () => {
+    if (!psd || !slots.length) return
+    window.localStorage.setItem(configKeyForTemplate(psdName, psd), JSON.stringify({ slots }))
+    setStatus(`已保存 ${slots.length} 个槽位配置`)
+  }
+
+  const loadTemplateConfig = () => {
+    if (!psd) return
+    const saved = readSavedSlots(psdName, psd, layers)
+    if (!saved) {
+      setStatus('没有找到当前 PSD 的配置')
+      return
+    }
+    setSlots(saved)
+    setStatus(`已载入 ${saved.length} 个槽位配置`)
+  }
 
   const handlePsd = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
@@ -779,7 +1075,8 @@ function App() {
       const buffer = await file.arrayBuffer()
       const nextPsd = readPsd(buffer, { skipThumbnail: true })
       const flat = flattenLayers(nextPsd.children)
-      const defaults = pickDefaultSlots(flat)
+      const saved = readSavedSlots(file.name, nextPsd, flat)
+      const defaults = saved || pickDefaultSlots(flat)
       setPsd(nextPsd)
       setPsdName(file.name)
       setLayers(flat)
@@ -788,7 +1085,7 @@ function App() {
       setSheetName('')
       setDownload(null)
       setPreviewIndex(0)
-      setStatus(`已识别 ${flat.length} 个图层`)
+      setStatus(saved ? `已识别 ${flat.length} 个图层，并载入配置` : `已识别 ${flat.length} 个图层`)
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'PSD 读取失败')
     } finally {
@@ -827,10 +1124,10 @@ function App() {
       setLayers(flat)
       setSlots(buildDemoSlots(flat))
       setRows([
-        { 页面名称: '测试_A款_新人价', 商品图: 'product-a.png', 角标文案: '新人价', 价格: '¥129' },
-        { 页面名称: '测试_B款_会员价', 商品图: 'product-b.png', 角标文案: '会员价', 价格: '¥159' },
-        { 页面名称: '测试_横版_限时价', 商品图: 'product-c-wide.png', 角标文案: '限时价', 价格: '¥199' },
-        { 页面名称: '测试_竖版_秒杀价', 商品图: 'product-d-tall.png', 角标文案: '秒杀价', 价格: '¥89' },
+        { 页面名称: '张三_新人价', 姓名: '张三', Logo: 'logo-a.png', 商品图: 'product-a.png', 角标文案: '新人价', 价格: '¥129' },
+        { 页面名称: '李四_会员价', 姓名: '李四', Logo: 'logo-b.png', 商品图: 'product-b.png', 角标文案: '会员价', 价格: '¥159' },
+        { 页面名称: '王五_限时价', 姓名: '王五', Logo: 'logo-c.png', 商品图: 'product-c-wide.png', 角标文案: '限时价', 价格: '¥199' },
+        { 页面名称: '赵六_秒杀价', 姓名: '赵六', Logo: 'logo-d.png', 商品图: 'product-d-tall.png', 角标文案: '秒杀价', 价格: '¥89' },
       ])
       setSheetName('demo-data.csv')
       setDownload(null)
@@ -859,6 +1156,28 @@ function App() {
       setStatus(`已载入 ${assets.length} 张图片`)
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '图片读取失败')
+    } finally {
+      setBusy(false)
+      event.target.value = ''
+    }
+  }
+
+  const handleFonts = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []).filter((file) =>
+      /\.(ttf|otf|woff2?|ttc)$/i.test(file.name),
+    )
+    if (!files.length) return
+    setBusy(true)
+    setStatus('读取字体')
+    try {
+      const assets = await Promise.all(files.map(fontFromFile))
+      setFonts((previous) => {
+        previous.forEach((asset) => URL.revokeObjectURL(asset.url))
+        return assets
+      })
+      setStatus(`已载入 ${assets.length} 个字体`)
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : '字体读取失败')
     } finally {
       setBusy(false)
       event.target.value = ''
@@ -910,7 +1229,7 @@ function App() {
       const zip = new JSZip()
       for (let index = 0; index < generatedRows.length; index += 1) {
         const row = generatedRows[index]
-        const canvas = renderPsd(psd, slots, row, images)
+        const canvas = renderPsd(psd, slots, row, images, fonts)
         const blob = await canvasToBlob(canvas)
         zip.file(`${String(index + 1).padStart(3, '0')}_${getRowLabel(row, index)}.png`, blob)
         setStatus(`生成 ${index + 1}/${generatedRows.length}`)
@@ -949,6 +1268,14 @@ function App() {
         accept=".csv,.xlsx"
         onChange={handleSheet}
       />
+      <input
+        ref={fontInputRef}
+        className="hidden-input"
+        type="file"
+        accept=".ttf,.otf,.woff,.woff2,.ttc"
+        multiple
+        onChange={handleFonts}
+      />
 
       <aside className="panel">
         <header className="brand">
@@ -986,6 +1313,10 @@ function App() {
             <FileSpreadsheet size={18} />
             数据表
           </button>
+          <button type="button" onClick={() => fontInputRef.current?.click()} disabled={busy}>
+            <Type size={18} />
+            字体
+          </button>
         </div>
 
         <section className="metric-row">
@@ -1003,10 +1334,26 @@ function App() {
           </div>
         </section>
 
+        {generatedRows.length > 0 && slots.length > 0 && (
+          <section className={`qa-strip ${errorCount ? 'has-error' : validationIssues.length ? 'has-warning' : ''}`}>
+            <AlertTriangle size={17} />
+            <div>
+              <strong>{validationIssues.length ? `${validationIssues.length} 个数据提醒` : '数据匹配正常'}</strong>
+              <span>{validationIssues[0]?.message || `${slots.length} 个槽位已匹配 ${generatedRows.length} 行数据`}</span>
+            </div>
+          </section>
+        )}
+
         <section className="stack">
           <div className="section-title">
             <Layers size={18} />
             <span>替换槽位</span>
+            <button type="button" className="icon-button" onClick={saveTemplateConfig} disabled={!slots.length} title="保存当前 PSD 槽位配置">
+              <Save size={16} />
+            </button>
+            <button type="button" className="icon-button" onClick={loadTemplateConfig} disabled={!psd} title="载入当前 PSD 槽位配置">
+              <FolderOpen size={16} />
+            </button>
             <button type="button" className="icon-button" onClick={resetSlots} disabled={!layers.length} title="重选建议槽位">
               <RefreshCcw size={16} />
             </button>
@@ -1020,7 +1367,7 @@ function App() {
                     <strong>{slot.name}</strong>
                     <span>{slot.path}</span>
                   </div>
-                  <div className={`slot-controls ${slot.type === 'text' ? 'text-slot-controls' : ''}`}>
+                  <div className={`slot-controls ${slot.type === 'text' ? 'text-slot-controls' : 'image-slot-controls'}`}>
                     <input value={slot.alias} onChange={(event) => updateSlot(slot.id, { alias: event.target.value })} />
                     <select
                       value={slot.type}
@@ -1032,6 +1379,7 @@ function App() {
                           color: type === 'text' ? (slot.color ?? '#ffffff') : slot.color,
                           align: type === 'text' ? (slot.align ?? 'center') : slot.align,
                           weight: type === 'text' ? (slot.weight ?? 850) : slot.weight,
+                          mask: type === 'image' ? (slot.mask ?? 'rect') : slot.mask,
                         })
                       }}
                     >
@@ -1061,15 +1409,45 @@ function App() {
                           title="文字颜色"
                           onChange={(event) => updateSlot(slot.id, { color: event.target.value })}
                         />
+                        <select
+                          className="wide-control"
+                          value={slot.fontFamily ?? ''}
+                          title="字体"
+                          onChange={(event) => updateSlot(slot.id, { fontFamily: event.target.value })}
+                        >
+                          {fontOptions.map((font) => (
+                            <option key={font.value || 'default'} value={font.value}>
+                              {font.label}
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          value={slot.align ?? 'center'}
+                          title="对齐"
+                          onChange={(event) => updateSlot(slot.id, { align: event.target.value as CanvasTextAlign })}
+                        >
+                          <option value="left">左对齐</option>
+                          <option value="center">居中</option>
+                          <option value="right">右对齐</option>
+                        </select>
                       </>
                     ) : (
-                      <select value={slot.mode} onChange={(event) => updateSlot(slot.id, { mode: event.target.value as SlotMode })}>
-                        {Object.entries(modeLabels).map(([mode, label]) => (
-                          <option key={mode} value={mode}>
-                            {label}
-                          </option>
-                        ))}
-                      </select>
+                      <>
+                        <select value={slot.mode} onChange={(event) => updateSlot(slot.id, { mode: event.target.value as SlotMode })}>
+                          {Object.entries(modeLabels).map(([mode, label]) => (
+                            <option key={mode} value={mode}>
+                              {label}
+                            </option>
+                          ))}
+                        </select>
+                        <select value={slot.mask ?? 'rect'} onChange={(event) => updateSlot(slot.id, { mask: event.target.value as SlotMask })}>
+                          {Object.entries(maskLabels).map(([mask, label]) => (
+                            <option key={mask} value={mask}>
+                              {label}
+                            </option>
+                          ))}
+                        </select>
+                      </>
                     )}
                   </div>
                 </div>
