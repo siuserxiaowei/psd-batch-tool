@@ -110,6 +110,9 @@ type GalleryItem = {
   index: number
 }
 
+const directSlotIdKey = '__directSlotId'
+const directKindKey = '__directKind'
+
 const modeLabels: Record<SlotMode, string> = {
   fill: '铺满',
   fit: '完整',
@@ -360,6 +363,72 @@ const inferSlotMask = (item: Pick<FlatLayer, 'name'>): SlotMask => {
   if (/(头像|人像|headshot|avatar|portrait)/i.test(item.name)) return 'circle'
   if (/(logo|标志|商标|icon|图标)/i.test(item.name)) return 'round'
   return 'rect'
+}
+
+const directTextSize = (width: number, height: number) => {
+  const shortEdge = Math.max(1, Math.min(width, height))
+  return Math.max(36, Math.min(180, Math.round(shortEdge * 0.22)))
+}
+
+const textStrokeFor = (color?: string) => {
+  const raw = String(color || '').trim()
+  const match = raw.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i)
+  if (!match) return 'rgba(28, 46, 48, 0.72)'
+  const hex = match[1].length === 3 ? match[1].replace(/./g, (item) => item + item) : match[1]
+  const r = parseInt(hex.slice(0, 2), 16)
+  const g = parseInt(hex.slice(2, 4), 16)
+  const b = parseInt(hex.slice(4, 6), 16)
+  const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+  return luminance > 0.56 ? 'rgba(28, 46, 48, 0.72)' : 'rgba(255, 250, 240, 0.9)'
+}
+
+const getLayerById = (psd: Psd, id: string) => {
+  const parts = id
+    .split('.')
+    .map((part) => Number(part))
+    .filter((part) => Number.isInteger(part) && part >= 0)
+  let children = psd.children
+  let current: Layer | undefined
+
+  for (const part of parts) {
+    current = children?.[part]
+    if (!current) return undefined
+    children = isGroup(current) ? current.children : undefined
+  }
+
+  return current
+}
+
+const averageLayerLuminance = (layer?: Layer) => {
+  if (!layer?.canvas) return undefined
+  const width = Math.max(1, Math.min(32, layer.canvas.width))
+  const height = Math.max(1, Math.min(32, layer.canvas.height))
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
+  if (!ctx) return undefined
+
+  try {
+    ctx.drawImage(layer.canvas, 0, 0, width, height)
+    const data = ctx.getImageData(0, 0, width, height).data
+    let total = 0
+    let count = 0
+    for (let index = 0; index < data.length; index += 4) {
+      const alpha = data[index + 3] / 255
+      if (alpha < 0.08) continue
+      total += ((0.2126 * data[index] + 0.7152 * data[index + 1] + 0.0722 * data[index + 2]) / 255) * alpha
+      count += alpha
+    }
+    return count ? total / count : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const readableTextColorForLayer = (layer?: Layer) => {
+  const luminance = averageLayerLuminance(layer)
+  return luminance !== undefined && luminance < 0.46 ? '#ffffff' : '#233f40'
 }
 
 const slotFromLayer = (item: FlatLayer, used: Set<string>): SlotConfig => {
@@ -843,7 +912,8 @@ function drawReplacementText(
   let fontSize = baseSize
 
   ctx.save()
-  ctx.fillStyle = slot.color || '#ffffff'
+  const fillColor = slot.color || '#ffffff'
+  ctx.fillStyle = fillColor
   ctx.textAlign = slot.align || 'center'
   ctx.textBaseline = 'middle'
   ctx.font = `${weight} ${fontSize}px ${family}`
@@ -869,9 +939,15 @@ function drawReplacementText(
 
   const anchorX = slot.align === 'left' ? left + width * 0.04 : slot.align === 'right' ? left + width * 0.96 : left + width / 2
   const firstY = top + height / 2 - totalHeight / 2 + lineHeight / 2
+  ctx.lineJoin = 'round'
+  ctx.miterLimit = 2
+  ctx.strokeStyle = textStrokeFor(fillColor)
+  ctx.lineWidth = Math.max(2, Math.round(fontSize * 0.08))
 
   lines.forEach((line, index) => {
-    ctx.fillText(line, anchorX, firstY + index * lineHeight)
+    const y = firstY + index * lineHeight
+    ctx.strokeText(line, anchorX, y)
+    ctx.fillText(line, anchorX, y)
   })
   ctx.restore()
 }
@@ -897,6 +973,55 @@ function renderPsd(
     imageIndex.set(asset.stem.toLowerCase(), asset)
   })
   const fontIndex = buildFontIndex(fonts)
+  const directSlotId = row ? String(row[directSlotIdKey] ?? '') : ''
+  const directKind = row ? String(row[directKindKey] ?? '') : ''
+
+  const drawFinalDirectReplacement = () => {
+    if (!row || !directSlotId) return
+    const baseSlot = slotMap.get(directSlotId)
+    const layer = getLayerById(psd, directSlotId)
+    if (!baseSlot || !layer) return
+
+    const slot: SlotConfig =
+      directKind === 'text'
+        ? { ...baseSlot, type: 'text' }
+        : directKind === 'image'
+          ? { ...baseSlot, type: 'image' }
+          : baseSlot
+    if (resolveVisibility(row, slot) === false) return
+
+    const { left, top, width, height } = slotBox(layer, slot)
+    const slotColor = slot.color?.toLowerCase()
+    const fallbackColor =
+      directKind === 'text' && (!slot.color || slotColor === '#ffffff')
+        ? readableTextColorForLayer(layer)
+        : slot.color
+    const drawSlot: SlotConfig =
+      slot.type === 'text'
+        ? {
+            ...slot,
+            fontSize: slot.fontSize ?? directTextSize(width, height),
+            color: fallbackColor ?? '#ffffff',
+            align: slot.align ?? 'center',
+            weight: slot.weight ?? 900,
+          }
+        : slot
+    const text = drawSlot.type === 'text' ? resolveTextForSlot(row, drawSlot) : undefined
+    const replacement = drawSlot.type === 'image' ? resolveImageForSlot(row, drawSlot, images, imageIndex) : undefined
+
+    ctx.save()
+    ctx.globalAlpha = 1
+    ctx.globalCompositeOperation = 'source-over'
+    if (drawSlot.type === 'text' && text !== undefined) {
+      drawReplacementText(ctx, text, left, top, width, height, {
+        ...drawSlot,
+        fontFamily: resolveFontForSlot(row, drawSlot, fontIndex),
+      })
+    } else if (replacement) {
+      drawReplacement(ctx, replacement.image, left, top, width, height, drawSlot.mode, drawSlot.mask)
+    }
+    ctx.restore()
+  }
 
   if (mode === 'composite' && psd.canvas) {
     ctx.drawImage(psd.canvas, 0, 0)
@@ -905,6 +1030,7 @@ function renderPsd(
     const drawSlotReplacement = (layer: Layer, id: string) => {
       const slot = slotMap.get(id)
       if (!slot) return
+      if (id === directSlotId) return
       const visible = resolveVisibility(row, slot)
       if (visible === false) return
 
@@ -932,6 +1058,7 @@ function renderPsd(
     }
 
     psd.children?.forEach((layer, index) => visitLayer(layer, `${index}`))
+    drawFinalDirectReplacement()
     return canvas
   }
 
@@ -948,6 +1075,7 @@ function renderPsd(
     if (slot && row) {
       const visible = resolveVisibility(row, slot)
       if (visible === false) return
+      if (slot.id === directSlotId) return
     }
 
     const { left, top, width, height } = slotBox(layer, slot)
@@ -979,6 +1107,7 @@ function renderPsd(
     ctx.drawImage(psd.canvas, 0, 0)
   }
 
+  drawFinalDirectReplacement()
   return canvas
 }
 
@@ -1142,7 +1271,7 @@ function App() {
     }
 
     window.requestAnimationFrame(() => {
-      const items = generatedRows.slice(0, 60).map((row, index) => {
+      const items = generatedRows.map((row, index) => {
         const canvas = renderPsd(psd, slots, row, images, fonts, renderMode)
         return {
           url: canvas.toDataURL('image/png'),
@@ -1340,23 +1469,32 @@ function App() {
       setStatus('先选择要替换的 PSD 图层')
       return
     }
-    if (activeSlot.type !== 'text') {
-      updateSlot(activeSlot.id, {
-        type: 'text',
-        fontSize: activeSlot.fontSize ?? 36,
-        color: activeSlot.color ?? '#ffffff',
-        align: activeSlot.align ?? 'center',
-        weight: activeSlot.weight ?? 850,
-      })
-    }
     const values = parseElementList(elementText)
     if (!values.length) {
       setStatus('先输入要替换的名字，一行一个')
       return
     }
+    const item = layerById.get(activeSlot.id)
+    const box = item ? slotBox(item.layer, activeSlot) : undefined
+    const recommendedFontSize = box ? directTextSize(box.width, box.height) : 64
+    const nextFontSize = Math.max(activeSlot.fontSize ?? 0, recommendedFontSize)
+    const currentColor = activeSlot.color?.toLowerCase()
+    const nextColor =
+      activeSlot.color && (item?.kind === 'text' || currentColor !== '#ffffff')
+        ? activeSlot.color
+        : readableTextColorForLayer(item?.layer)
+    updateSlot(activeSlot.id, {
+      type: 'text',
+      fontSize: nextFontSize,
+      color: nextColor,
+      align: activeSlot.align ?? 'center',
+      weight: activeSlot.weight ?? 900,
+    })
     setRows(
       values.map((value, index) => ({
         页面名称: safeName(value || `第${index + 1}张`),
+        [directSlotIdKey]: activeSlot.id,
+        [directKindKey]: 'text',
         [activeSlot.alias]: value,
       })),
     )
@@ -1381,6 +1519,8 @@ function App() {
     setRows(
       images.map((asset) => ({
         页面名称: asset.stem,
+        [directSlotIdKey]: activeSlot.id,
+        [directKindKey]: 'image',
         [activeSlot.alias]: asset.name,
       })),
     )
@@ -1395,7 +1535,7 @@ function App() {
     setActiveSlotId(item.id)
     setSlots((previous) => {
       if (previous.some((slot) => slot.id === item.id)) {
-        return previous.filter((slot) => slot.id !== item.id)
+        return previous
       }
       const used = new Set(previous.map((slot) => slot.alias.toLowerCase()))
       return [...previous, slotFromLayer(item, used)]
@@ -1554,9 +1694,9 @@ function App() {
           </div>
           <div className="active-slot-pill">
             <strong>{activeSlot ? activeSlot.name : '未选择图层'}</strong>
-            <span>{activeSlot ? `${activeSlot.alias} · ${slotTypeLabels[activeSlot.type]}` : '先在 PSD 图层或替换槽位里点一个图层'}</span>
+            <span>{activeSlot ? `目标：${activeSlot.alias} · ${slotTypeLabels[activeSlot.type]}` : '先在 PSD 图层里点一个图层'}</span>
           </div>
-          <p className="element-hint">只替换当前选中的图层；其他图层没有填数据时会保持原样。</p>
+          <p className="element-hint">下面每一行都会替换到当前图层的位置；其他图层保持 PSD 原样。</p>
           <textarea
             value={elementText}
             onChange={(event) => setElementText(event.target.value)}
@@ -1564,10 +1704,10 @@ function App() {
           />
           <div className="element-actions">
             <button type="button" onClick={applyTextElements} disabled={!activeSlot || !elementCount}>
-              生成 {elementCount || 0} 张文字图
+              替换成 {elementCount || 0} 个文字
             </button>
             <button type="button" onClick={applyImageElements} disabled={!activeSlot || !images.length}>
-              用 {images.length} 张图片替换
+              替换成 {images.length} 张图片
             </button>
           </div>
         </section>
@@ -1729,7 +1869,7 @@ function App() {
         <section className="stack layer-browser">
           <div className="section-title">
             <MousePointer2 size={18} />
-            <span>PSD 图层</span>
+            <span>PSD 图层（点一下作为目标）</span>
           </div>
           <div className="layer-list">
             {layers.length ? (
