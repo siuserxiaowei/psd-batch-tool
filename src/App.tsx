@@ -104,6 +104,12 @@ type GuideBox = {
   height: number
 }
 
+type GalleryItem = {
+  url: string
+  label: string
+  index: number
+}
+
 const modeLabels: Record<SlotMode, string> = {
   fill: '铺满',
   fit: '完整',
@@ -984,6 +990,12 @@ const canvasToBlob = (canvas: HTMLCanvasElement) =>
     }, 'image/png')
   })
 
+const parseElementList = (value: string) =>
+  value
+    .split(/\r?\n|[,，]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+
 function validateRows(rows: RowData[], slots: SlotConfig[], images: ImageAsset[]) {
   if (!rows.length || !slots.length) return []
   const imageIndex = new Map<string, ImageAsset>()
@@ -996,29 +1008,13 @@ function validateRows(rows: RowData[], slots: SlotConfig[], images: ImageAsset[]
   rows.forEach((row, rowIndex) => {
     slots.forEach((slot) => {
       if (slot.type === 'text') {
-        if (resolveTextForSlot(row, slot) === undefined) {
-          issues.push({
-            rowIndex,
-            alias: slot.alias,
-            severity: 'warning',
-            message: `第 ${rowIndex + 1} 行缺少「${slot.alias}」文字`,
-          })
-        }
         return
       }
 
       const raw = [slot.alias, slot.name, slot.path, stripExtension(slot.alias)]
         .map((key) => row[key])
         .find((item) => String(item ?? '').trim())
-      if (!raw) {
-        issues.push({
-          rowIndex,
-          alias: slot.alias,
-          severity: 'warning',
-          message: `第 ${rowIndex + 1} 行缺少「${slot.alias}」图片名`,
-        })
-        return
-      }
+      if (!raw) return
 
       const normalized = normalizeKey(raw)
       const stem = stripExtension(normalized)
@@ -1047,6 +1043,8 @@ function App() {
   const [download, setDownload] = useState<DownloadState | null>(null)
   const [previewIndex, setPreviewIndex] = useState(0)
   const [previewUrl, setPreviewUrl] = useState('')
+  const [gallery, setGallery] = useState<GalleryItem[]>([])
+  const [elementText, setElementText] = useState('')
   const [status, setStatus] = useState('等待 PSD')
   const [activeSlotId, setActiveSlotId] = useState('')
   const [showGuides, setShowGuides] = useState(true)
@@ -1060,12 +1058,13 @@ function App() {
   const generatedRows = useMemo<RowData[]>(() => {
     if (rows.length) return rows
     if (!slots.length || !images.length) return []
-    const primary = slots[0]
+    const selected = slots.find((slot) => slot.id === activeSlotId && slot.type === 'image')
+    const primary = selected || slots.find((slot) => slot.type === 'image') || slots[0]
     return images.map((asset) => ({
       [primary.alias]: asset.name,
       __name: asset.stem,
     }))
-  }, [images, rows, slots])
+  }, [activeSlotId, images, rows, slots])
 
   const selectedIds = useMemo(() => new Set(slots.map((slot) => slot.id)), [slots])
   const slotAliases = useMemo(() => slots.map((slot) => slot.alias).join(' / '), [slots])
@@ -1087,6 +1086,11 @@ function App() {
     () => [...builtInFonts, ...fonts.map((font) => ({ label: stripExtension(font.name), value: font.family }))],
     [fonts],
   )
+  const activeSlot = useMemo(
+    () => slots.find((slot) => slot.id === activeSlotId) || slots[0],
+    [activeSlotId, slots],
+  )
+  const elementCount = useMemo(() => parseElementList(elementText).length, [elementText])
   const activeRow = generatedRows[previewIndex]
 
   useEffect(() => {
@@ -1127,6 +1131,32 @@ function App() {
       if (download) URL.revokeObjectURL(download.url)
     }
   }, [download])
+
+  useEffect(() => {
+    let cancelled = false
+    if (!psd || !generatedRows.length) {
+      window.requestAnimationFrame(() => {
+        if (!cancelled) setGallery([])
+      })
+      return
+    }
+
+    window.requestAnimationFrame(() => {
+      const items = generatedRows.slice(0, 60).map((row, index) => {
+        const canvas = renderPsd(psd, slots, row, images, fonts, renderMode)
+        return {
+          url: canvas.toDataURL('image/png'),
+          label: getRowLabel(row, index),
+          index,
+        }
+      })
+      if (!cancelled) setGallery(items)
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [fonts, generatedRows, images, psd, renderMode, slots])
 
   const readSavedSlots = (name: string, template: Psd, flat: FlatLayer[]) => {
     try {
@@ -1305,6 +1335,61 @@ function App() {
     }
   }
 
+  const applyTextElements = () => {
+    if (!activeSlot) {
+      setStatus('先选择要替换的 PSD 图层')
+      return
+    }
+    if (activeSlot.type !== 'text') {
+      updateSlot(activeSlot.id, {
+        type: 'text',
+        fontSize: activeSlot.fontSize ?? 36,
+        color: activeSlot.color ?? '#ffffff',
+        align: activeSlot.align ?? 'center',
+        weight: activeSlot.weight ?? 850,
+      })
+    }
+    const values = parseElementList(elementText)
+    if (!values.length) {
+      setStatus('先输入要替换的名字，一行一个')
+      return
+    }
+    setRows(
+      values.map((value, index) => ({
+        页面名称: safeName(value || `第${index + 1}张`),
+        [activeSlot.alias]: value,
+      })),
+    )
+    setSheetName('手动输入')
+    setDownload(null)
+    setPreviewIndex(0)
+    setStatus(`已生成 ${values.length} 个「${activeSlot.alias}」替换结果`)
+  }
+
+  const applyImageElements = () => {
+    if (!activeSlot) {
+      setStatus('先选择要替换的 PSD 图层')
+      return
+    }
+    if (!images.length) {
+      setStatus('先上传要替换的图片元素')
+      return
+    }
+    if (activeSlot.type !== 'image') {
+      updateSlot(activeSlot.id, { type: 'image', mode: activeSlot.mode ?? 'fill', mask: activeSlot.mask ?? 'rect' })
+    }
+    setRows(
+      images.map((asset) => ({
+        页面名称: asset.stem,
+        [activeSlot.alias]: asset.name,
+      })),
+    )
+    setSheetName('批量图片')
+    setDownload(null)
+    setPreviewIndex(0)
+    setStatus(`已生成 ${images.length} 个「${activeSlot.alias}」替换结果`)
+  }
+
   const toggleSlot = (item: FlatLayer) => {
     if (!canUseAsSlot(item)) return
     setActiveSlotId(item.id)
@@ -1461,6 +1546,31 @@ function App() {
             </div>
           </section>
         )}
+
+        <section className="element-batch">
+          <div className="section-title">
+            <Type size={18} />
+            <span>批量替换当前图层</span>
+          </div>
+          <div className="active-slot-pill">
+            <strong>{activeSlot ? activeSlot.name : '未选择图层'}</strong>
+            <span>{activeSlot ? `${activeSlot.alias} · ${slotTypeLabels[activeSlot.type]}` : '先在 PSD 图层或替换槽位里点一个图层'}</span>
+          </div>
+          <p className="element-hint">只替换当前选中的图层；其他图层没有填数据时会保持原样。</p>
+          <textarea
+            value={elementText}
+            onChange={(event) => setElementText(event.target.value)}
+            placeholder={'一行一个名字，例如：\n张三\n李四\n王五'}
+          />
+          <div className="element-actions">
+            <button type="button" onClick={applyTextElements} disabled={!activeSlot || !elementCount}>
+              生成 {elementCount || 0} 张文字图
+            </button>
+            <button type="button" onClick={applyImageElements} disabled={!activeSlot || !images.length}>
+              用 {images.length} 张图片替换
+            </button>
+          </div>
+        </section>
 
         <section className="stack">
           <div className="section-title">
@@ -1693,6 +1803,28 @@ function App() {
             </div>
           )}
         </div>
+
+        {gallery.length > 0 && (
+          <section className="gallery-panel">
+            <div className="gallery-head">
+              <strong>批量结果</strong>
+              <span>{gallery.length} / {generatedRows.length} 张</span>
+            </div>
+            <div className="gallery-grid">
+              {gallery.map((item) => (
+                <button
+                  type="button"
+                  className={`gallery-card ${item.index === previewIndex ? 'active' : ''}`}
+                  key={`${item.index}-${item.label}`}
+                  onClick={() => setPreviewIndex(item.index)}
+                >
+                  <img src={item.url} alt={item.label} />
+                  <span>{item.index + 1}. {item.label}</span>
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
 
         <footer className="footerbar">
           <div className="batch-info">

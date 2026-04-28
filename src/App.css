@@ -225,6 +225,88 @@ button {
   opacity: 0.76;
 }
 
+.element-batch {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.active-slot-pill {
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  color: #274447;
+  background: #eef4f1;
+  border: 1px solid #cbdad5;
+  border-radius: 6px;
+}
+
+.active-slot-pill strong,
+.active-slot-pill span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.active-slot-pill strong {
+  font-size: 13px;
+}
+
+.active-slot-pill span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.element-hint {
+  margin: -2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.element-batch textarea {
+  width: 100%;
+  min-height: 104px;
+  resize: vertical;
+  padding: 10px;
+  color: var(--ink);
+  background: #fdfcf7;
+  border: 1px solid #dad7cb;
+  border-radius: 6px;
+  outline: none;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.element-batch textarea:focus {
+  border-color: #2d4b4e;
+}
+
+.element-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.element-actions button {
+  min-height: 38px;
+  padding: 0 10px;
+  color: #f9f7ef;
+  background: #2d4b4e;
+  border: 1px solid #2d4b4e;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.element-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .stack {
   display: flex;
   flex-direction: column;
@@ -608,6 +690,75 @@ button {
   background: rgba(255, 255, 255, 0.72);
   border: 1px dashed #bfc8c4;
   border-radius: 8px;
+}
+
+.gallery-panel {
+  min-height: 0;
+  display: grid;
+  gap: 10px;
+  margin-bottom: 22px;
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.gallery-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ink);
+}
+
+.gallery-head span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(116px, 1fr));
+  gap: 10px;
+  max-height: 340px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.gallery-card {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  color: var(--ink);
+  text-align: left;
+  background: #fdfcf7;
+  border: 1px solid #ded8c9;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.gallery-card.active {
+  border-color: #d29b37;
+  box-shadow: inset 0 0 0 1px rgba(210, 155, 55, 0.58);
+}
+
+.gallery-card img {
+  width: 100%;
+  aspect-ratio: 4 / 5;
+  object-fit: contain;
+  background:
+    linear-gradient(45deg, rgba(45, 75, 78, 0.06) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(45, 75, 78, 0.06) 25%, transparent 25%);
+  background-size: 18px 18px;
+  border-radius: 5px;
+}
+
+.gallery-card span {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
 }
 
 .footerbar {
