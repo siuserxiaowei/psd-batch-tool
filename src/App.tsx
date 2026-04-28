@@ -29,6 +29,7 @@ type SlotMode = 'fill' | 'fit' | 'stretch'
 type SlotMask = 'rect' | 'round' | 'circle'
 type SlotType = 'image' | 'text'
 type LayerKind = 'group' | 'image' | 'text'
+type RenderMode = 'layers' | 'composite'
 
 type FlatLayer = {
   id: string
@@ -55,6 +56,10 @@ type SlotConfig = {
   align?: CanvasTextAlign
   weight?: number
   fontFamily?: string
+  left?: number
+  top?: number
+  width?: number
+  height?: number
 }
 
 type ImageAsset = {
@@ -86,6 +91,17 @@ type ValidationIssue = {
   alias: string
   message: string
   severity: 'warning' | 'error'
+}
+
+type GuideBox = {
+  id: string
+  name: string
+  alias: string
+  type: SlotType
+  left: number
+  top: number
+  width: number
+  height: number
 }
 
 const modeLabels: Record<SlotMode, string> = {
@@ -295,6 +311,30 @@ const layerBox = (layer: Layer) => {
   return { left, top, width, height }
 }
 
+const slotBox = (layer: Layer, slot?: SlotConfig) => {
+  const original = layerBox(layer)
+  return {
+    left: slot?.left ?? original.left,
+    top: slot?.top ?? original.top,
+    width: slot?.width ?? original.width,
+    height: slot?.height ?? original.height,
+  }
+}
+
+const hasUsableBox = (item: Pick<FlatLayer, 'kind' | 'width' | 'height'>) =>
+  item.kind !== 'group' && item.width > 4 && item.height > 4
+
+const canUseAsSlot = (item: FlatLayer) =>
+  hasUsableBox(item) && (hasCanvas(item.layer) || item.kind === 'text' || isReplacementLayer(item))
+
+const needsCompositePreview = (psd: Psd | null, layers: FlatLayer[]) => {
+  if (!psd?.canvas || !layers.length) return false
+  const leaves = layers.filter((item) => hasUsableBox(item) && !item.hidden)
+  if (!leaves.length) return false
+  const drawable = leaves.filter((item) => hasCanvas(item.layer)).length
+  return drawable / leaves.length < 0.72
+}
+
 const inferSlotType = (item: Pick<FlatLayer, 'kind' | 'name'>): SlotType => {
   if (item.kind === 'text') return 'text'
   return /(文字|文案|标题|价格|姓名|名字|名称|标签|价|name|text|title|price|label)/i.test(item.name)
@@ -357,13 +397,13 @@ const flattenLayers = (children: Layer[] = [], parent = '', depth = 0): FlatLaye
 
 const pickDefaultSlots = (layers: FlatLayer[]) => {
   const used = new Set<string>()
-  const usable = layers.filter((item) => hasCanvas(item.layer) && !item.hidden && item.width > 40 && item.height > 40)
+  const usable = layers.filter((item) => canUseAsSlot(item) && !item.hidden && item.width > 12 && item.height > 12)
   const replacement = usable.filter(isReplacementLayer)
   const preferred = usable.filter((item) => !/(背景|底图|background|bg|backdrop)/i.test(item.name))
   const source = replacement.length ? replacement : preferred.length ? preferred : usable
 
   return source
-    .filter((item) => hasCanvas(item.layer) && !item.hidden && item.width > 40 && item.height > 40)
+    .filter((item) => canUseAsSlot(item) && !item.hidden && item.width > 12 && item.height > 12)
     .sort((a, b) => {
       const aBoost = /(商品|产品|主图|图片|换图|替换|image|photo|product|replace)/i.test(a.name) ? 10_000_000 : 0
       const bBoost = /(商品|产品|主图|图片|换图|替换|image|photo|product|replace)/i.test(b.name) ? 10_000_000 : 0
@@ -836,6 +876,7 @@ function renderPsd(
   row: RowData | undefined,
   images: ImageAsset[],
   fonts: FontAsset[],
+  mode: RenderMode,
 ): HTMLCanvasElement {
   const canvas = document.createElement('canvas')
   canvas.width = psd.width
@@ -851,6 +892,43 @@ function renderPsd(
   })
   const fontIndex = buildFontIndex(fonts)
 
+  if (mode === 'composite' && psd.canvas) {
+    ctx.drawImage(psd.canvas, 0, 0)
+    if (!row) return canvas
+
+    const drawSlotReplacement = (layer: Layer, id: string) => {
+      const slot = slotMap.get(id)
+      if (!slot) return
+      const visible = resolveVisibility(row, slot)
+      if (visible === false) return
+
+      const { left, top, width, height } = slotBox(layer, slot)
+      const text = slot.type === 'text' ? resolveTextForSlot(row, slot) : undefined
+      const replacement = slot.type === 'image' ? resolveImageForSlot(row, slot, images, imageIndex) : undefined
+
+      if (slot.type === 'text' && text !== undefined) {
+        drawReplacementText(ctx, text, left, top, width, height, {
+          ...slot,
+          fontFamily: resolveFontForSlot(row, slot, fontIndex),
+        })
+      } else if (replacement) {
+        drawReplacement(ctx, replacement.image, left, top, width, height, slot.mode, slot.mask)
+      }
+    }
+
+    const visitLayer = (layer: Layer, id: string) => {
+      if (layer.hidden) return
+      if (isGroup(layer)) {
+        layer.children.forEach((child, index) => visitLayer(child, `${id}.${index}`))
+        return
+      }
+      drawSlotReplacement(layer, id)
+    }
+
+    psd.children?.forEach((layer, index) => visitLayer(layer, `${index}`))
+    return canvas
+  }
+
   const drawLayer = (layer: Layer, id: string) => {
     if (layer.hidden) return
     if (isGroup(layer)) {
@@ -860,15 +938,13 @@ function renderPsd(
       return
     }
 
-    const original = layer.canvas
-    if (!original) return
     const slot = slotMap.get(id)
     if (slot && row) {
       const visible = resolveVisibility(row, slot)
       if (visible === false) return
     }
 
-    const { left, top, width, height } = layerBox(layer)
+    const { left, top, width, height } = slotBox(layer, slot)
     ctx.save()
     ctx.globalAlpha = layer.opacity ?? 1
     ctx.globalCompositeOperation = blendModes[layer.blendMode || 'normal'] || 'source-over'
@@ -882,7 +958,8 @@ function renderPsd(
       })
     } else if (replacement && slot) {
       drawReplacement(ctx, replacement.image, left, top, width, height, slot.mode, slot.mask)
-    } else {
+    } else if (layer.canvas) {
+      const original = layer.canvas
       ctx.drawImage(original, left, top)
     }
     ctx.restore()
@@ -971,6 +1048,9 @@ function App() {
   const [previewIndex, setPreviewIndex] = useState(0)
   const [previewUrl, setPreviewUrl] = useState('')
   const [status, setStatus] = useState('等待 PSD')
+  const [activeSlotId, setActiveSlotId] = useState('')
+  const [showGuides, setShowGuides] = useState(true)
+  const [forceLayerRender, setForceLayerRender] = useState(false)
   const [busy, setBusy] = useState(false)
   const psdInputRef = useRef<HTMLInputElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
@@ -989,6 +1069,18 @@ function App() {
 
   const selectedIds = useMemo(() => new Set(slots.map((slot) => slot.id)), [slots])
   const slotAliases = useMemo(() => slots.map((slot) => slot.alias).join(' / '), [slots])
+  const layerById = useMemo(() => new Map(layers.map((item) => [item.id, item])), [layers])
+  const renderMode: RenderMode = psd && !forceLayerRender && needsCompositePreview(psd, layers) ? 'composite' : 'layers'
+  const guideBoxes = useMemo<GuideBox[]>(() => {
+    return slots
+      .map((slot) => {
+        const item = layerById.get(slot.id)
+        if (!item) return undefined
+        const { left, top, width, height } = slotBox(item.layer, slot)
+        return { id: slot.id, name: slot.name, alias: slot.alias, type: slot.type, left, top, width, height }
+      })
+      .filter((item): item is GuideBox => Boolean(item && item.width > 0 && item.height > 0))
+  }, [layerById, slots])
   const validationIssues = useMemo(() => validateRows(generatedRows, slots, images), [generatedRows, images, slots])
   const errorCount = validationIssues.filter((issue) => issue.severity === 'error').length
   const fontOptions = useMemo(
@@ -1004,7 +1096,7 @@ function App() {
 
     let revoked = ''
     window.requestAnimationFrame(() => {
-      const canvas = renderPsd(psd, slots, activeRow, images, fonts)
+      const canvas = renderPsd(psd, slots, activeRow, images, fonts, renderMode)
       const url = canvas.toDataURL('image/png')
       revoked = url
       setPreviewUrl((previous) => {
@@ -1016,7 +1108,7 @@ function App() {
     return () => {
       if (revoked.startsWith('blob:')) URL.revokeObjectURL(revoked)
     }
-  }, [activeRow, fonts, images, psd, slots])
+  }, [activeRow, fonts, images, psd, renderMode, slots])
 
   useEffect(() => {
     return () => {
@@ -1063,6 +1155,7 @@ function App() {
       return
     }
     setSlots(saved)
+    setActiveSlotId(saved[0]?.id || '')
     setStatus(`已载入 ${saved.length} 个槽位配置`)
   }
 
@@ -1085,6 +1178,8 @@ function App() {
       setSheetName('')
       setDownload(null)
       setPreviewIndex(0)
+      setActiveSlotId(defaults[0]?.id || '')
+      setForceLayerRender(false)
       setStatus(saved ? `已识别 ${flat.length} 个图层，并载入配置` : `已识别 ${flat.length} 个图层`)
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'PSD 读取失败')
@@ -1100,11 +1195,14 @@ function App() {
     setPsd(nextPsd)
     setPsdName('demo-template.psd')
     setLayers(flat)
-    setSlots(buildDemoSlots(flat))
+    const demoSlots = buildDemoSlots(flat)
+    setSlots(demoSlots)
     setRows([])
     setSheetName('')
     setDownload(null)
     setPreviewIndex(0)
+    setActiveSlotId(demoSlots[0]?.id || '')
+    setForceLayerRender(false)
     setStatus(`样例 ${flat.length} 个图层`)
   }
 
@@ -1122,7 +1220,8 @@ function App() {
       setPsd(nextPsd)
       setPsdName('demo-template.psd')
       setLayers(flat)
-      setSlots(buildDemoSlots(flat))
+      const demoSlots = buildDemoSlots(flat)
+      setSlots(demoSlots)
       setRows([
         { 页面名称: '张三_新人价', 姓名: '张三', Logo: 'logo-a.png', 商品图: 'product-a.png', 角标文案: '新人价', 价格: '¥129' },
         { 页面名称: '李四_会员价', 姓名: '李四', Logo: 'logo-b.png', 商品图: 'product-b.png', 角标文案: '会员价', 价格: '¥159' },
@@ -1132,6 +1231,8 @@ function App() {
       setSheetName('demo-data.csv')
       setDownload(null)
       setPreviewIndex(0)
+      setActiveSlotId(demoSlots[0]?.id || '')
+      setForceLayerRender(false)
       setStatus('测试数据 4 行')
     } catch (error) {
       setStatus(error instanceof Error ? error.message : '测试数据生成失败')
@@ -1205,7 +1306,8 @@ function App() {
   }
 
   const toggleSlot = (item: FlatLayer) => {
-    if (!hasCanvas(item.layer) || item.kind === 'group') return
+    if (!canUseAsSlot(item)) return
+    setActiveSlotId(item.id)
     setSlots((previous) => {
       if (previous.some((slot) => slot.id === item.id)) {
         return previous.filter((slot) => slot.id !== item.id)
@@ -1219,7 +1321,23 @@ function App() {
     setSlots((previous) => previous.map((slot) => (slot.id === id ? { ...slot, ...patch } : slot)))
   }
 
-  const resetSlots = () => setSlots(pickDefaultSlots(layers))
+  const updateSlotNumber = (id: string, key: 'left' | 'top' | 'width' | 'height', value: string) => {
+    const parsed = Math.round(Number(value))
+    if (!Number.isFinite(parsed)) return
+    updateSlot(id, { [key]: Math.max(key === 'width' || key === 'height' ? 1 : 0, parsed) })
+  }
+
+  const getSlotNumber = (slot: SlotConfig, key: 'left' | 'top' | 'width' | 'height') => {
+    const item = layerById.get(slot.id)
+    if (!item) return slot[key] ?? 0
+    return Math.round(slotBox(item.layer, slot)[key])
+  }
+
+  const resetSlots = () => {
+    const defaults = pickDefaultSlots(layers)
+    setSlots(defaults)
+    setActiveSlotId(defaults[0]?.id || '')
+  }
 
   const exportZip = async () => {
     if (!psd || !generatedRows.length) return
@@ -1229,7 +1347,7 @@ function App() {
       const zip = new JSZip()
       for (let index = 0; index < generatedRows.length; index += 1) {
         const row = generatedRows[index]
-        const canvas = renderPsd(psd, slots, row, images, fonts)
+        const canvas = renderPsd(psd, slots, row, images, fonts, renderMode)
         const blob = await canvasToBlob(canvas)
         zip.file(`${String(index + 1).padStart(3, '0')}_${getRowLabel(row, index)}.png`, blob)
         setStatus(`生成 ${index + 1}/${generatedRows.length}`)
@@ -1362,7 +1480,11 @@ function App() {
           <div className="slot-list">
             {slots.length ? (
               slots.map((slot) => (
-                <div className="slot-card" key={slot.id}>
+                <div
+                  className={`slot-card ${slot.id === activeSlotId ? 'active' : ''}`}
+                  key={slot.id}
+                  onClick={() => setActiveSlotId(slot.id)}
+                >
                   <div>
                     <strong>{slot.name}</strong>
                     <span>{slot.path}</span>
@@ -1450,6 +1572,42 @@ function App() {
                       </>
                     )}
                   </div>
+                  <div className="box-controls">
+                    <label>
+                      X
+                      <input
+                        type="number"
+                        value={getSlotNumber(slot, 'left')}
+                        onChange={(event) => updateSlotNumber(slot.id, 'left', event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      Y
+                      <input
+                        type="number"
+                        value={getSlotNumber(slot, 'top')}
+                        onChange={(event) => updateSlotNumber(slot.id, 'top', event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      W
+                      <input
+                        type="number"
+                        min={1}
+                        value={getSlotNumber(slot, 'width')}
+                        onChange={(event) => updateSlotNumber(slot.id, 'width', event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      H
+                      <input
+                        type="number"
+                        min={1}
+                        value={getSlotNumber(slot, 'height')}
+                        onChange={(event) => updateSlotNumber(slot.id, 'height', event.target.value)}
+                      />
+                    </label>
+                  </div>
                 </div>
               ))
             ) : (
@@ -1468,11 +1626,11 @@ function App() {
               layers.map((item) => (
                 <button
                   type="button"
-                  className={`layer-row ${selectedIds.has(item.id) ? 'selected' : ''}`}
+                  className={`layer-row ${selectedIds.has(item.id) ? 'selected' : ''} ${item.id === activeSlotId ? 'active-slot' : ''}`}
                   key={item.id}
                   style={{ paddingLeft: `${12 + item.depth * 14}px` }}
                   onClick={() => toggleSlot(item)}
-                  disabled={item.kind === 'group' || !hasCanvas(item.layer)}
+                  disabled={!canUseAsSlot(item)}
                 >
                   <span>{selectedIds.has(item.id) && <Check size={14} />}</span>
                   <strong>{item.name}</strong>
@@ -1490,8 +1648,21 @@ function App() {
         <header className="topbar">
           <div>
             <h1>批量出图工作台</h1>
-            <p>{slotAliases || '导入 PSD 后选择可替换图层'}</p>
+            <p>
+              {slotAliases || '导入 PSD 后选择可替换图层'}
+              {psd && <span className="render-mode"> · {renderMode === 'composite' ? '合成图预览' : '图层预览'}</span>}
+            </p>
           </div>
+          {psd && (
+            <div className="view-tools">
+              <button type="button" onClick={() => setShowGuides((value) => !value)}>
+                {showGuides ? '隐藏框' : '显示框'}
+              </button>
+              <button type="button" onClick={() => setForceLayerRender((value) => !value)}>
+                {forceLayerRender ? '自动预览' : '图层预览'}
+              </button>
+            </div>
+          )}
           <div className="status-pill">
             {busy ? <Loader2 className="spin" size={16} /> : <Archive size={16} />}
             <span>{status}</span>
@@ -1499,8 +1670,22 @@ function App() {
         </header>
 
         <div className="preview-stage">
-          {previewUrl ? (
-            <img src={previewUrl} alt="PSD preview" />
+          {previewUrl && psd ? (
+            <div className="preview-artboard">
+              <img src={previewUrl} alt="PSD preview" />
+              {showGuides && guideBoxes.length > 0 && (
+                <svg className="preview-guides" viewBox={`0 0 ${psd.width} ${psd.height}`} aria-hidden="true">
+                  {guideBoxes.map((box) => (
+                    <g key={box.id} className={box.id === activeSlotId ? 'guide active' : 'guide'} onClick={() => setActiveSlotId(box.id)}>
+                      <rect x={box.left} y={box.top} width={box.width} height={box.height} rx={8} ry={8} />
+                      <text x={box.left + 8} y={Math.max(18, box.top + 18)}>
+                        {box.alias}
+                      </text>
+                    </g>
+                  ))}
+                </svg>
+              )}
+            </div>
           ) : (
             <div className="preview-empty">
               <FileImage size={42} />
