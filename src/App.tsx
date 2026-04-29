@@ -306,7 +306,32 @@ const parseRows = async (file: File): Promise<RowData[]> => {
   return matrixToRows(rows)
 }
 
-const hasCanvas = (layer: Layer) => Boolean(layer.canvas)
+const layerRasterCache = new WeakMap<Layer, HTMLCanvasElement>()
+
+const rasterCanvasForLayer = (layer: Layer) => {
+  if (layer.canvas) return layer.canvas
+  if (!layer.imageData) return undefined
+  const cached = layerRasterCache.get(layer)
+  if (cached) return cached
+  const { width, height, data } = layer.imageData
+  if (!width || !height || data.length < width * height * 4) return undefined
+
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return undefined
+
+  const rgba = new Uint8ClampedArray(width * height * 4)
+  for (let index = 0; index < rgba.length; index += 1) {
+    rgba[index] = Number(data[index] ?? 0)
+  }
+  ctx.putImageData(new ImageData(rgba, width, height), 0, 0)
+  layerRasterCache.set(layer, canvas)
+  return canvas
+}
+
+const hasPixels = (layer: Layer) => Boolean(layer.canvas || layer.imageData)
 
 const isGroup = (layer: Layer): layer is Layer & { children: Layer[] } => Array.isArray(layer.children)
 
@@ -315,8 +340,10 @@ const isText = (layer: Layer) => 'text' in layer
 const layerBox = (layer: Layer) => {
   const left = layer.left ?? 0
   const top = layer.top ?? 0
-  const width = Math.max(0, (layer.right ?? left + (layer.canvas?.width ?? 0)) - left)
-  const height = Math.max(0, (layer.bottom ?? top + (layer.canvas?.height ?? 0)) - top)
+  const fallbackWidth = layer.canvas?.width ?? layer.imageData?.width ?? 0
+  const fallbackHeight = layer.canvas?.height ?? layer.imageData?.height ?? 0
+  const width = Math.max(0, (layer.right ?? left + fallbackWidth) - left)
+  const height = Math.max(0, (layer.bottom ?? top + fallbackHeight) - top)
   return { left, top, width, height }
 }
 
@@ -333,14 +360,13 @@ const slotBox = (layer: Layer, slot?: SlotConfig) => {
 const hasUsableBox = (item: Pick<FlatLayer, 'kind' | 'width' | 'height'>) =>
   item.kind !== 'group' && item.width > 4 && item.height > 4
 
-const canUseAsSlot = (item: FlatLayer) =>
-  hasUsableBox(item) && (hasCanvas(item.layer) || item.kind === 'text' || isReplacementLayer(item))
+const canUseAsSlot = (item: FlatLayer) => hasUsableBox(item)
 
 const needsCompositePreview = (psd: Psd | null, layers: FlatLayer[]) => {
   if (!psd?.canvas || !layers.length) return false
   const leaves = layers.filter((item) => hasUsableBox(item) && !item.hidden)
   if (!leaves.length) return false
-  const drawable = leaves.filter((item) => hasCanvas(item.layer)).length
+  const drawable = leaves.filter((item) => hasPixels(item.layer)).length
   return drawable / leaves.length < 0.72
 }
 
@@ -400,9 +426,11 @@ const getLayerById = (psd: Psd, id: string) => {
 }
 
 const averageLayerLuminance = (layer?: Layer) => {
-  if (!layer?.canvas) return undefined
-  const width = Math.max(1, Math.min(32, layer.canvas.width))
-  const height = Math.max(1, Math.min(32, layer.canvas.height))
+  if (!layer) return undefined
+  const source = rasterCanvasForLayer(layer)
+  if (!source) return undefined
+  const width = Math.max(1, Math.min(32, source.width))
+  const height = Math.max(1, Math.min(32, source.height))
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
@@ -410,7 +438,7 @@ const averageLayerLuminance = (layer?: Layer) => {
   if (!ctx) return undefined
 
   try {
-    ctx.drawImage(layer.canvas, 0, 0, width, height)
+    ctx.drawImage(source, 0, 0, width, height)
     const data = ctx.getImageData(0, 0, width, height).data
     let total = 0
     let count = 0
@@ -475,7 +503,10 @@ const pickDefaultSlots = (layers: FlatLayer[]) => {
   const usable = layers.filter((item) => canUseAsSlot(item) && !item.hidden && item.width > 12 && item.height > 12)
   const replacement = usable.filter(isReplacementLayer)
   const preferred = usable.filter((item) => !/(背景|底图|background|bg|backdrop)/i.test(item.name))
-  const source = replacement.length ? replacement : preferred.length ? preferred : usable
+  const replacementIds = new Set(replacement.map((item) => item.id))
+  const source = preferred.length
+    ? [...replacement, ...preferred.filter((item) => !replacementIds.has(item.id))]
+    : usable
 
   return source
     .filter((item) => canUseAsSlot(item) && !item.hidden && item.width > 12 && item.height > 12)
@@ -484,8 +515,18 @@ const pickDefaultSlots = (layers: FlatLayer[]) => {
       const bBoost = /(商品|产品|主图|图片|换图|替换|image|photo|product|replace)/i.test(b.name) ? 10_000_000 : 0
       return b.width * b.height + bBoost - (a.width * a.height + aBoost)
     })
-    .slice(0, replacement.length ? 12 : 4)
+    .slice(0, 40)
     .map<SlotConfig>((item) => slotFromLayer(item, used))
+}
+
+const mergeSlotConfigs = (defaults: SlotConfig[], saved?: SlotConfig[]) => {
+  if (!saved?.length) return defaults
+  const usedIds = new Set(saved.map((slot) => slot.id))
+  const usedAliases = new Set(saved.map((slot) => slot.alias.toLowerCase()))
+  const missing = defaults
+    .filter((slot) => !usedIds.has(slot.id))
+    .map((slot) => ({ ...slot, alias: toAlias(slot.alias, usedAliases) }))
+  return [...saved, ...missing]
 }
 
 const buildDemoSlots = (layers: FlatLayer[]) => {
@@ -797,9 +838,14 @@ function resolveVisibility(row: RowData, slot: SlotConfig) {
   return ['1', 'true', 'yes', 'y', '显示', '是'].includes(value)
 }
 
-function resolveTextForSlot(row: RowData, slot: SlotConfig) {
+function resolveRawForSlot(row: RowData, slot: SlotConfig) {
   const keys = [slot.alias, slot.name, slot.path, stripExtension(slot.alias)]
   const raw = keys.map((key) => row[key]).find((item) => item !== undefined && item !== null && String(item).trim() !== '')
+  return raw === undefined || raw === null ? undefined : raw
+}
+
+function resolveTextForSlot(row: RowData, slot: SlotConfig) {
+  const raw = resolveRawForSlot(row, slot)
   return raw === undefined || raw === null ? undefined : String(raw)
 }
 
@@ -1092,8 +1138,12 @@ function renderPsd(
       })
     } else if (replacement && slot) {
       drawReplacement(ctx, replacement.image, left, top, width, height, slot.mode, slot.mask)
-    } else if (layer.canvas) {
-      const original = layer.canvas
+    } else {
+      const original = rasterCanvasForLayer(layer)
+      if (!original) {
+        ctx.restore()
+        return
+      }
       ctx.drawImage(original, left, top)
     }
     ctx.restore()
@@ -1221,6 +1271,17 @@ function App() {
   )
   const elementCount = useMemo(() => parseElementList(elementText).length, [elementText])
   const activeRow = generatedRows[previewIndex]
+  const slotById = useMemo(() => new Map(slots.map((slot) => [slot.id, slot])), [slots])
+  const guideLabels = useMemo(() => {
+    const labels = new Map<string, string>()
+    guideBoxes.forEach((box) => {
+      const slot = slotById.get(box.id)
+      const raw = activeRow && slot ? resolveRawForSlot(activeRow, slot) : undefined
+      const value = raw === undefined || raw === null ? '' : String(raw).trim()
+      labels.set(box.id, value ? `${box.alias}: ${value}` : box.alias)
+    })
+    return labels
+  }, [activeRow, guideBoxes, slotById])
 
   useEffect(() => {
     if (!psd) {
@@ -1313,9 +1374,10 @@ function App() {
       setStatus('没有找到当前 PSD 的配置')
       return
     }
-    setSlots(saved)
-    setActiveSlotId(saved[0]?.id || '')
-    setStatus(`已载入 ${saved.length} 个槽位配置`)
+    const merged = mergeSlotConfigs(pickDefaultSlots(layers), saved)
+    setSlots(merged)
+    setActiveSlotId(merged[0]?.id || '')
+    setStatus(`已载入 ${saved.length} 个配置，并补齐到 ${merged.length} 个可替换图层`)
   }
 
   const handlePsd = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1328,7 +1390,7 @@ function App() {
       const nextPsd = readPsd(buffer, { skipThumbnail: true })
       const flat = flattenLayers(nextPsd.children)
       const saved = readSavedSlots(file.name, nextPsd, flat)
-      const defaults = saved || pickDefaultSlots(flat)
+      const defaults = mergeSlotConfigs(pickDefaultSlots(flat), saved)
       setPsd(nextPsd)
       setPsdName(file.name)
       setLayers(flat)
@@ -1339,7 +1401,7 @@ function App() {
       setPreviewIndex(0)
       setActiveSlotId(defaults[0]?.id || '')
       setForceLayerRender(false)
-      setStatus(saved ? `已识别 ${flat.length} 个图层，并载入配置` : `已识别 ${flat.length} 个图层`)
+      setStatus(saved ? `已识别 ${flat.length} 个图层，并补齐 ${defaults.length} 个槽位` : `已识别 ${flat.length} 个图层`)
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'PSD 读取失败')
     } finally {
@@ -1924,16 +1986,25 @@ function App() {
             <div className="preview-artboard">
               <img src={previewUrl} alt="PSD preview" />
               {showGuides && guideBoxes.length > 0 && (
-                <svg className="preview-guides" viewBox={`0 0 ${psd.width} ${psd.height}`} aria-hidden="true">
+                <div className="preview-guides">
                   {guideBoxes.map((box) => (
-                    <g key={box.id} className={box.id === activeSlotId ? 'guide active' : 'guide'} onClick={() => setActiveSlotId(box.id)}>
-                      <rect x={box.left} y={box.top} width={box.width} height={box.height} rx={8} ry={8} />
-                      <text x={box.left + 8} y={Math.max(18, box.top + 18)}>
-                        {box.alias}
-                      </text>
-                    </g>
+                    <button
+                      type="button"
+                      key={box.id}
+                      className={box.id === activeSlotId ? 'guide-box active' : 'guide-box'}
+                      style={{
+                        left: `${(box.left / psd.width) * 100}%`,
+                        top: `${(box.top / psd.height) * 100}%`,
+                        width: `${(box.width / psd.width) * 100}%`,
+                        height: `${(box.height / psd.height) * 100}%`,
+                      }}
+                      onClick={() => setActiveSlotId(box.id)}
+                      aria-label={`选择 ${box.alias}`}
+                    >
+                      <span>{guideLabels.get(box.id) || box.alias}</span>
+                    </button>
                   ))}
-                </svg>
+                </div>
               )}
             </div>
           ) : (
