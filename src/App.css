@@ -114,6 +114,7 @@ button {
 }
 
 .action-grid button,
+.action-grid a,
 .export-button {
   min-height: 42px;
   display: inline-flex;
@@ -125,17 +126,20 @@ button {
   border: 1px solid #2d4b4e;
   border-radius: 6px;
   cursor: pointer;
+  text-decoration: none;
   transition:
     background 140ms ease,
     transform 140ms ease,
     opacity 140ms ease;
 }
 
-.action-grid button {
+.action-grid button,
+.action-grid a {
   padding: 0 8px;
 }
 
 .action-grid button:hover,
+.action-grid a:hover,
 .export-button:hover {
   background: #173739;
   transform: translateY(-1px);

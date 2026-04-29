@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import {
   AlertTriangle,
   Archive,
+  BookOpen,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -1722,6 +1723,14 @@ function App() {
             <Type size={18} />
             字体
           </button>
+          <a
+            href="https://github.com/siuserxiaowei/psd-batch-tool/blob/main/docs/usage.md"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <BookOpen size={18} />
+            使用说明
+          </a>
         </div>
 
         <section className="metric-row">
