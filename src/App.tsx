@@ -31,6 +31,7 @@ type SlotMask = 'rect' | 'round' | 'circle'
 type SlotType = 'image' | 'text'
 type LayerKind = 'group' | 'image' | 'text'
 type RenderMode = 'layers' | 'composite'
+type GuideMode = 'active' | 'all' | 'hidden'
 
 type FlatLayer = {
   id: string
@@ -1227,7 +1228,7 @@ function App() {
   const [elementText, setElementText] = useState('')
   const [status, setStatus] = useState('等待 PSD')
   const [activeSlotId, setActiveSlotId] = useState('')
-  const [showGuides, setShowGuides] = useState(true)
+  const [guideMode, setGuideMode] = useState<GuideMode>('active')
   const [forceLayerRender, setForceLayerRender] = useState(false)
   const [busy, setBusy] = useState(false)
   const psdInputRef = useRef<HTMLInputElement>(null)
@@ -1247,7 +1248,6 @@ function App() {
   }, [activeSlotId, images, rows, slots])
 
   const selectedIds = useMemo(() => new Set(slots.map((slot) => slot.id)), [slots])
-  const slotAliases = useMemo(() => slots.map((slot) => slot.alias).join(' / '), [slots])
   const layerById = useMemo(() => new Map(layers.map((item) => [item.id, item])), [layers])
   const renderMode: RenderMode = psd && !forceLayerRender && needsCompositePreview(psd, layers) ? 'composite' : 'layers'
   const guideBoxes = useMemo<GuideBox[]>(() => {
@@ -1270,6 +1270,16 @@ function App() {
     () => slots.find((slot) => slot.id === activeSlotId) || slots[0],
     [activeSlotId, slots],
   )
+  const slotSummary = useMemo(() => {
+    if (!slots.length) return '导入 PSD 后选择可替换图层'
+    return `${slots.length} 个可替换图层${activeSlot ? ` · 当前：${activeSlot.alias}` : ''}`
+  }, [activeSlot, slots.length])
+  const visibleGuideBoxes = useMemo(() => {
+    if (guideMode === 'hidden') return []
+    if (guideMode === 'all') return guideBoxes
+    const targetId = activeSlot?.id || activeSlotId
+    return targetId ? guideBoxes.filter((box) => box.id === targetId) : []
+  }, [activeSlot, activeSlotId, guideBoxes, guideMode])
   const elementCount = useMemo(() => parseElementList(elementText).length, [elementText])
   const activeRow = generatedRows[previewIndex]
   const slotById = useMemo(() => new Map(slots.map((slot) => [slot.id, slot])), [slots])
@@ -1970,14 +1980,24 @@ function App() {
           <div>
             <h1>批量出图工作台</h1>
             <p>
-              {slotAliases || '导入 PSD 后选择可替换图层'}
+              {slotSummary}
               {psd && <span className="render-mode"> · {renderMode === 'composite' ? '合成图预览' : '图层预览'}</span>}
             </p>
           </div>
           {psd && (
             <div className="view-tools">
-              <button type="button" onClick={() => setShowGuides((value) => !value)}>
-                {showGuides ? '隐藏框' : '显示框'}
+              <button
+                type="button"
+                onClick={() => setGuideMode((mode) => (mode === 'hidden' ? 'active' : 'hidden'))}
+              >
+                {guideMode === 'hidden' ? '显示当前框' : '隐藏框'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setGuideMode((mode) => (mode === 'all' ? 'active' : 'all'))}
+                disabled={guideMode === 'hidden'}
+              >
+                {guideMode === 'all' ? '只看当前框' : '全部框'}
               </button>
               <button type="button" onClick={() => setForceLayerRender((value) => !value)}>
                 {forceLayerRender ? '自动预览' : '图层预览'}
@@ -1994,13 +2014,14 @@ function App() {
           {previewUrl && psd ? (
             <div className="preview-artboard">
               <img src={previewUrl} alt="PSD preview" />
-              {showGuides && guideBoxes.length > 0 && (
-                <div className="preview-guides">
-                  {guideBoxes.map((box) => (
+              {visibleGuideBoxes.length > 0 && (
+                <div className={guideMode === 'all' ? 'preview-guides all-guides' : 'preview-guides'}>
+                  {visibleGuideBoxes.map((box) => (
                     <button
                       type="button"
                       key={box.id}
                       className={box.id === activeSlotId ? 'guide-box active' : 'guide-box'}
+                      title={guideLabels.get(box.id) || box.alias}
                       style={{
                         left: `${(box.left / psd.width) * 100}%`,
                         top: `${(box.top / psd.height) * 100}%`,
@@ -2010,7 +2031,9 @@ function App() {
                       onClick={() => setActiveSlotId(box.id)}
                       aria-label={`选择 ${box.alias}`}
                     >
-                      <span>{guideLabels.get(box.id) || box.alias}</span>
+                      {(guideMode !== 'all' || box.id === activeSlotId) && (
+                        <span>{guideLabels.get(box.id) || box.alias}</span>
+                      )}
                     </button>
                   ))}
                 </div>

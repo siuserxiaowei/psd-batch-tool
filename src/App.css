@@ -592,6 +592,11 @@ button {
   white-space: nowrap;
 }
 
+.view-tools button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .status-pill {
   min-height: 36px;
   display: inline-flex;
@@ -696,6 +701,17 @@ button {
   background: rgba(255, 91, 82, 0.14);
   border-color: #ff5b52;
   border-width: 3px;
+}
+
+.all-guides .guide-box:not(.active) {
+  background: rgba(210, 155, 55, 0.06);
+  border-color: rgba(210, 155, 55, 0.54);
+  border-width: 1px;
+}
+
+.all-guides .guide-box:not(.active):hover {
+  background: rgba(210, 155, 55, 0.15);
+  border-color: rgba(210, 155, 55, 0.92);
 }
 
 .guide-box.active span {
