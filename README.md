@@ -1,5 +1,18 @@
 # PSD 批量换图工作台
 
+<!-- SIUSER-SEO-INTRO:START -->
+
+## 项目介绍 / Project Introduction
+
+**中文介绍**：PSD 批处理工具，用于图片素材、设计文件和内容生产流程中的批量处理与自动化。
+
+**English**: A PSD batch processing tool for automating image assets, design files, and content production workflows.
+
+**SEO 关键词 / SEO Keywords**: PSD, batch processing, design automation, image workflow, 设计自动化
+
+<!-- SIUSER-SEO-INTRO:END -->
+
+
 一个给设计师和运营同学试用的 PSD 海报批量生成原型。它的目标很简单：保留设计师在 Photoshop 里的模板工作流，把重复出图这一步变成网页里的几次点击。
 
 给设计师看的操作文档：[PSD 批量换图工作台使用说明](./docs/usage.md)
@@ -106,3 +119,17 @@ npm run build
 - PSD 的复杂效果、智能对象和部分高级混合效果可能无法完全还原。
 - 文字渲染使用浏览器字体，和 Photoshop 字体可能存在细微差异。
 - 更适合验证「批量替换和出图流程」是否顺手，后续再补更完整的 PSD 兼容性。
+
+<!-- SIUSER-CONTACT:START -->
+
+## 联系我 / Contact
+
+想交流 AI 工具、内容自动化、SEO、私域增长或项目合作，可以扫码加我微信。
+
+For collaboration on AI tools, content automation, SEO, private-domain growth, or product experiments, scan the WeChat QR code below.
+
+<img src="https://raw.githubusercontent.com/siuserxiaowei/siuserxiaowei/main/assets/contact/wechat-qrcode.jpg" width="180" alt="WeChat QR code / 微信二维码" />
+
+**关键词 / Keywords**: PSD, batch processing, design automation, image workflow, AI tools, AI automation, GitHub Pages, SEO
+
+<!-- SIUSER-CONTACT:END -->
